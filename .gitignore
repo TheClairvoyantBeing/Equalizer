@@ -16,3 +16,21 @@ local.properties
 __pycache__/
 *.pyc
 
+
+# Standard repository hygiene
+.idea/
+.vscode/
+*.py[cod]
+node_modules/
+dist/
+build/
+out/
+target/
+coverage/
+htmlcov/
+.venv/
+venv/
+env/
+.env
+.env.*
+reviews.md

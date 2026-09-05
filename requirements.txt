@@ -1,0 +1,2 @@
+# No Python dependencies were detected during repository standardization.
+# Add pinned packages here if Python tooling is introduced.
