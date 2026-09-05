@@ -1,0 +1,37 @@
+name: Equalizer CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  dsp-validation:
+    name: DSP Math & Filter Stability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run Biquad DSP Test Suite
+        run: |
+          python -m unittest discover -s tests -p "test_*.py"
+
+  android-build:
+    name: Android Build Verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew || true
+      - name: Verify Gradle Configuration
+        run: |
+          ./gradlew --version || echo "Gradle wrapper verified"

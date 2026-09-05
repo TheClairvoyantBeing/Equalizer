@@ -5,99 +5,100 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.os.Process
 import android.util.Log
 import androidx.annotation.RequiresPermission
 import kotlin.concurrent.thread
+import kotlin.math.cos
 import kotlin.math.pow
 import kotlin.math.sin
-import kotlin.math.cos
 
-// Represents one EQ band (center freq + gain)
+/**
+ * Represents an individual parametric EQ band (center frequency + gain).
+ */
 data class EqBand(
     val freq: Float,        // Center frequency in Hz
-    var gainDb: Float       // Gain in dB (-12 to +12 typical)
+    var gainDb: Float       // Gain in dB (-12 dB to +12 dB)
 )
 
-// Parametric peak EQ filter (Biquad)
+/**
+ * High-performance Transposed Direct Form II (TDF-II) Peaking Biquad Filter.
+ * Minimizes coefficient quantization noise and arithmetic memory footprint.
+ */
 class BiquadPeakingEQ(
     var sampleRate: Int,
     var band: EqBand
 ) {
-    private var b0 = 0.0
+    private var b0 = 1.0
     private var b1 = 0.0
     private var b2 = 0.0
     private var a1 = 0.0
     private var a2 = 0.0
 
-    private var x1 = 0.0
-    private var x2 = 0.0
-    private var y1 = 0.0
-    private var y2 = 0.0
+    // TDF-II state registers
+    private var s1 = 0.0
+    private var s2 = 0.0
 
     fun updateCoefficients(q: Double = 1.2) {
         val omega = 2.0 * Math.PI * band.freq / sampleRate
         val sinOmg = sin(omega)
         val cosOmg = cos(omega)
-        val A = 10.0.pow(band.gainDb / 40.0)
+        val aVal = 10.0.pow(band.gainDb / 40.0)
         val alpha = sinOmg / (2.0 * q)
 
-        b0 = 1 + alpha * A
-        b1 = -2 * cosOmg
-        b2 = 1 - alpha * A
-        val a0 = 1 + alpha / A
-        a1 = -2 * cosOmg
-        a2 = 1 - alpha / A
-
-        b0 /= a0
-        b1 /= a0
-        b2 /= a0
-        a1 /= a0
-        a2 /= a0
+        val a0 = 1.0 + alpha / aVal
+        b0 = (1.0 + alpha * aVal) / a0
+        b1 = (-2.0 * cosOmg) / a0
+        b2 = (1.0 - alpha * aVal) / a0
+        a1 = (-2.0 * cosOmg) / a0
+        a2 = (1.0 - alpha / aVal) / a0
     }
 
+    /**
+     * Processes a single audio sample using Transposed Direct Form II.
+     */
     fun process(sampleIn: Float): Float {
-        val x0 = sampleIn.toDouble()
-        val y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
-
-        x2 = x1
-        x1 = x0
-        y2 = y1
-        y1 = y0
-
-        return y0.toFloat()
+        val x = sampleIn.toDouble()
+        val y = b0 * x + s1
+        s1 = b1 * x - a1 * y + s2
+        s2 = b2 * x - a2 * y
+        return y.toFloat()
     }
 
     fun reset() {
-        x1 = 0.0
-        x2 = 0.0
-        y1 = 0.0
-        y2 = 0.0
+        s1 = 0.0
+        s2 = 0.0
     }
 }
 
+/**
+ * Real-time 7-band parametric audio equalizer engine.
+ */
+class AudioEqualizer(val sampleRate: Int = 48000) {
 
-// The processing/IO/pipeline "engine"
-class AudioEqualizer {
-
-    // ---- Default band settings (customize here) ----
-    private val bands = listOf(
-        EqBand(62.5f,   6f),   // Sub-bass: +6dB
-        EqBand(187.5f,  3f),   // Bass: +3dB
-        EqBand(375f,    0f),   // Low-mid: 0dB
-        EqBand(750f,   -4f),   // Mid: -4dB
-        EqBand(1500f,   2f),   // Upper-mid: +2dB
-        EqBand(3000f,   5f),   // Presence: +5dB
-        EqBand(6000f,  -2f)    // Brilliance: -2dB
+    // 7 standard ISO frequency bands
+    val bands = listOf(
+        EqBand(62.5f,   0f),   // Sub-bass
+        EqBand(187.5f,  0f),   // Bass
+        EqBand(375f,    0f),   // Low-mid
+        EqBand(750f,    0f),   // Mid
+        EqBand(1500f,   0f),   // Upper-mid
+        EqBand(3000f,   0f),   // Presence
+        EqBand(6000f,   0f)    // Brilliance
     )
-    // ------------------------------------------------
 
-    private val sampleRate = 48000
     private val channelConfig = AudioFormat.CHANNEL_IN_MONO
     private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
-    private val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
+    private val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat).coerceAtLeast(2048)
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
-    private var running = false
+    
+    @Volatile
+    var running = false
+        private set
+
+    @Volatile
+    var isMuted = false
 
     private val filters = mutableListOf<BiquadPeakingEQ>()
 
@@ -109,10 +110,10 @@ class AudioEqualizer {
         }
     }
 
-    // Use this to change the gain for any band during runtime if needed
     fun setBandGain(bandIndex: Int, gainDb: Float) {
         if (bandIndex !in filters.indices) return
-        bands[bandIndex].gainDb = gainDb
+        val clampedGain = gainDb.coerceIn(-12f, 12f)
+        bands[bandIndex].gainDb = clampedGain
         filters[bandIndex].updateCoefficients(q = 1.2)
     }
 
@@ -120,10 +121,12 @@ class AudioEqualizer {
     fun start() {
         if (running) return
         running = true
+        
         audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
             sampleRate, channelConfig, audioFormat, bufferSize
         )
+        
         audioTrack = AudioTrack.Builder()
             .setAudioFormat(
                 AudioFormat.Builder()
@@ -136,15 +139,18 @@ class AudioEqualizer {
             .build()
 
         if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-            Log.e("EQ", "AudioRecord not initialized!")
+            Log.e("AudioEqualizer", "AudioRecord initialization failed!")
+            running = false
             return
         }
 
         audioRecord?.startRecording()
         audioTrack?.play()
 
+        thread(name = "AudioEqualizerDSPThread", priority = Thread.MAX_PRIORITY) {
+            // Set urgent audio Linux thread priority to prevent kernel preemption
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
 
-        thread(start = true) {
             val audioBuffer = ShortArray(bufferSize / 2)
             val floatBuffer = FloatArray(audioBuffer.size)
             val processedBuffer = ShortArray(audioBuffer.size)
@@ -152,24 +158,29 @@ class AudioEqualizer {
             while (running) {
                 val read = audioRecord?.read(audioBuffer, 0, audioBuffer.size) ?: 0
                 if (read > 0) {
+                    if (isMuted) {
+                        // Acoustic feedback guard active
+                        audioTrack?.write(ShortArray(read), 0, read)
+                        continue
+                    }
+
                     // Convert short to float [-1.0f, 1.0f]
                     for (i in 0 until read) {
                         floatBuffer[i] = audioBuffer[i] / 32768.0f
                     }
 
-                    // Apply EQ filters
+                    // Apply cascading 7-band biquad filters
                     for (i in 0 until read) {
                         var sample = floatBuffer[i]
-                        filters.forEach { filter ->
-                            sample = filter.process(sample)
+                        for (f in filters) {
+                            sample = f.process(sample)
                         }
-                        // Clamp and convert back to short
+                        // Anti-clipping saturation guard
                         processedBuffer[i] = (sample.coerceIn(-1.0f, 1.0f) * 32767).toInt().toShort()
                     }
 
-                    // Write filtered audio
+                    // Stream processed PCM buffer to audio hardware
                     audioTrack?.write(processedBuffer, 0, read)
-                    Log.d("EQ", "Processed $read samples")
                 }
             }
         }
@@ -177,9 +188,22 @@ class AudioEqualizer {
 
     fun stop() {
         running = false
-        audioRecord?.stop()
-        audioRecord?.release()
-        audioTrack?.stop()
-        audioTrack?.release()
+        try {
+            audioRecord?.stop()
+            audioRecord?.release()
+        } catch (e: Exception) {
+            Log.w("AudioEqualizer", "Error stopping AudioRecord: ${e.message}")
+        } finally {
+            audioRecord = null
+        }
+
+        try {
+            audioTrack?.stop()
+            audioTrack?.release()
+        } catch (e: Exception) {
+            Log.w("AudioEqualizer", "Error stopping AudioTrack: ${e.message}")
+        } finally {
+            audioTrack = null
+        }
     }
 }
